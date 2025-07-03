@@ -138,53 +138,69 @@ func SafeReplace(xmlPath, oldText string, newText interface{}) error {
 		}
 	}
 
-	// Находим все элементы t
-	for _, t := range doc.FindElements("//w:t") {
-		fullText := t.Text()
+	// Находим все параграфы
+	for _, p := range doc.FindElements("//w:p") {
+		// Собираем весь текст параграфа
+		fullText := ""
+		for _, t := range p.FindElements(".//w:t") {
+			fullText += t.Text()
+		}
 
+		// Проверяем, содержится ли шаблон в собранном тексте
 		if strings.Contains(fullText, oldText) {
-			// Находим родительский run (w:r)
-			r := t.Parent()
-			if r == nil {
-				continue
-			}
+			// Копируем свойства параграфа
+			pPr := p.SelectElement("w:pPr")
 
-			// Находим родительский параграф (w:p)
-			p := r.Parent()
-			if p == nil {
-				continue
+			// Копируем свойства run (берем из первого run)
+			var rPr *etree.Element
+			if firstRun := p.SelectElement("w:r"); firstRun != nil {
+				rPr = firstRun.SelectElement("w:rPr")
 			}
-
-			// Копируем свойства run
-			rPr := r.SelectElement("w:rPr")
 
 			switch v := newText.(type) {
 			case string:
 				// Обработка строки с переносами
 				parts := strings.Split(v, "\n")
 
-				// Удаляем исходный текстовый элемент
-				r.RemoveChild(t)
+				// Создаем новый run
+				newR := createElement("r")
+				if rPr != nil {
+					newR.AddChild(rPr.Copy())
+				}
 
-				// Добавляем новые элементы
+				// Добавляем текст с переносами
 				for i, part := range parts {
 					if i > 0 {
 						// Добавляем перенос строки
 						br := createElement("br")
-						r.AddChild(br)
+						newR.AddChild(br)
 					}
 
 					newT := createElement("t")
 					newT.SetText(part)
-					r.AddChild(newT)
+					newR.AddChild(newT)
+				}
+
+				// Создаем новый параграф
+				newP := createElement("p")
+				if pPr != nil {
+					newP.AddChild(pPr.Copy())
+				}
+				newP.AddChild(newR)
+
+				// Заменяем исходный параграф новым
+				if parent := p.Parent(); parent != nil {
+					for idx, child := range parent.Child {
+						if child == p {
+							parent.InsertChildAt(idx, newP)
+							parent.RemoveChild(p)
+							break
+						}
+					}
 				}
 
 			case []string:
 				// Обработка массива строк
-				// Копируем свойства параграфа
-				pPr := p.SelectElement("w:pPr")
-
-				// Создаем новые параграфы
 				var newParagraphs []*etree.Element
 				for _, line := range v {
 					newP := createElement("p")
@@ -259,10 +275,30 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	// defer os.RemoveAll("unzipped")
+	defer os.RemoveAll("unzipped")
 
 	// Замена текста во всех частях документа
-	err = ReplaceInAllFiles("unzipped", "{template1}", "Иван Иванов\nПетр Петров")
+	err = ReplaceInAllFiles("unzipped", "{tableName1}", "Иван Иванов\nПетр Петров")
+	if err != nil {
+		panic(err)
+	}
+	err = ReplaceInAllFiles("unzipped", "{data1}", "дата1")
+	if err != nil {
+		panic(err)
+	}
+	err = ReplaceInAllFiles("unzipped", "{data2}", "дата2")
+	if err != nil {
+		panic(err)
+	}
+	err = ReplaceInAllFiles("unzipped", "{data3}", "дата3")
+	if err != nil {
+		panic(err)
+	}
+	err = ReplaceInAllFiles("unzipped", "{data4}", "дата4")
+	if err != nil {
+		panic(err)
+	}
+	err = ReplaceInAllFiles("unzipped", "{data5}", "дата5")
 	if err != nil {
 		panic(err)
 	}
