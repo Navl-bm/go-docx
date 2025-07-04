@@ -6,7 +6,6 @@ import (
 	godocx "github.com/Navl-bm/go-docx"
 )
 
-// Пример использования
 func main() {
 	replacements := map[string]interface{}{
 		"{data1}": "text1",
