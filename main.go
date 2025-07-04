@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/beevik/etree"
 )
@@ -116,7 +118,7 @@ func ZipDocx(source, target string) error {
 	})
 }
 
-// SafeReplace заменяет текст в XML-файле с сохранением пространств имен и префиксов
+// SafeReplace заменяет текст в XML-файле с сохранением контекста, пробелов и форматирования
 func SafeReplace(xmlPath, oldText string, newText interface{}) error {
 	doc := etree.NewDocument()
 
@@ -140,110 +142,401 @@ func SafeReplace(xmlPath, oldText string, newText interface{}) error {
 
 	// Находим все параграфы
 	for _, p := range doc.FindElements("//w:p") {
-		// Собираем весь текст параграфа
+		// Собираем весь текст параграфа вместе с пробелами
 		fullText := ""
+		var textNodes []*etree.Element
+		var spaceNodes []*etree.Element // Для узлов с xml:space="preserve"
+
+		// Собираем все текстовые элементы в параграфе
 		for _, t := range p.FindElements(".//w:t") {
-			fullText += t.Text()
+			text := t.Text()
+			fullText += text
+
+			// Проверяем, является ли узел пробельным с сохранением
+			if spaceAttr := t.SelectAttr("xml:space"); spaceAttr != nil && spaceAttr.Value == "preserve" {
+				spaceNodes = append(spaceNodes, t)
+			}
+
+			textNodes = append(textNodes, t)
 		}
 
 		// Проверяем, содержится ли шаблон в собранном тексте
-		if strings.Contains(fullText, oldText) {
-			// Копируем свойства параграфа
-			pPr := p.SelectElement("w:pPr")
+		start := strings.Index(fullText, oldText)
+		if start == -1 {
+			continue
+		}
+		end := start + len(oldText)
 
-			// Копируем свойства run (берем из первого run)
-			var rPr *etree.Element
-			if firstRun := p.SelectElement("w:r"); firstRun != nil {
-				rPr = firstRun.SelectElement("w:rPr")
+		// Ищем узлы, содержащие часть шаблона
+		var startNode, endNode *etree.Element
+		var startOffset, endOffset int
+		currentPos := 0
+
+		for _, t := range textNodes {
+			text := t.Text()
+			textLen := len(text)
+
+			// Проверяем, находится ли начало шаблона в этом узле
+			if startNode == nil && currentPos <= start && start < currentPos+textLen {
+				startNode = t
+				startOffset = start - currentPos
 			}
+
+			// Проверяем, находится ли конец шаблона в этом узле
+			if endNode == nil && currentPos < end && end <= currentPos+textLen {
+				endNode = t
+				endOffset = end - currentPos
+			}
+
+			currentPos += textLen
+		}
+
+		// Если нашли начало и конец шаблона
+		if startNode != nil && endNode != nil {
+			// Находим родительский run для вставки
+			r := startNode.Parent()
+			if r == nil {
+				continue
+			}
+
+			// Копируем свойства run
+			rPr := r.SelectElement("w:rPr")
 
 			switch v := newText.(type) {
 			case string:
 				// Обработка строки с переносами
 				parts := strings.Split(v, "\n")
-
-				// Создаем новый run
-				newR := createElement("r")
-				if rPr != nil {
-					newR.AddChild(rPr.Copy())
+				trimmedParts := make([]string, len(parts))
+				for i, part := range parts {
+					trimmedParts[i] = strings.TrimSpace(part)
 				}
 
-				// Добавляем текст с переносами
-				for i, part := range parts {
+				// Создаем новые элементы для вставки
+				var newElements []*etree.Element
+				for i, part := range trimmedParts {
 					if i > 0 {
 						// Добавляем перенос строки
 						br := createElement("br")
-						newR.AddChild(br)
+						newElements = append(newElements, br)
 					}
 
-					newT := createElement("t")
-					newT.SetText(part)
-					newR.AddChild(newT)
+					if part != "" {
+						newT := createElement("t")
+						newT.SetText(part)
+
+						// Сохраняем атрибут xml:space если он был в оригинале
+						for _, sn := range spaceNodes {
+							if sn == startNode || sn == endNode {
+								newT.CreateAttr("xml:space", "preserve")
+								break
+							}
+						}
+
+						newElements = append(newElements, newT)
+					}
 				}
 
-				// Создаем новый параграф
-				newP := createElement("p")
-				if pPr != nil {
-					newP.AddChild(pPr.Copy())
-				}
-				newP.AddChild(newR)
+				// Заменяем шаблон новыми элементами
+				if startNode == endNode {
+					// Шаблон полностью в одном узле
+					text := startNode.Text()
+					prefix := text[:startOffset]
+					suffix := text[endOffset:]
 
-				// Заменяем исходный параграф новым
-				if parent := p.Parent(); parent != nil {
+					// Сохраняем пробел перед заменой
+					if prefix != "" && strings.HasSuffix(prefix, " ") {
+						spaceT := createElement("t")
+						spaceT.CreateAttr("xml:space", "preserve")
+						spaceT.SetText(" ")
+						newElements = append([]*etree.Element{spaceT}, newElements...)
+					}
+
+					// Сохраняем пробел после замены
+					if suffix != "" && strings.HasPrefix(suffix, " ") {
+						spaceT := createElement("t")
+						spaceT.CreateAttr("xml:space", "preserve")
+						spaceT.SetText(" ")
+						newElements = append(newElements, spaceT)
+						suffix = strings.TrimPrefix(suffix, " ")
+					}
+
+					// Создаем элементы для префикса и суффикса
+					if prefix != "" {
+						prefixT := createElement("t")
+						prefixT.SetText(prefix)
+						newElements = append([]*etree.Element{prefixT}, newElements...)
+					}
+
+					if suffix != "" {
+						suffixT := createElement("t")
+						suffixT.SetText(suffix)
+						newElements = append(newElements, suffixT)
+					}
+
+					// Находим позицию узла у родителя
+					parent := startNode.Parent()
 					for idx, child := range parent.Child {
-						if child == p {
-							parent.InsertChildAt(idx, newP)
-							parent.RemoveChild(p)
+						if child == startNode {
+							// Удаляем старый узел
+							parent.RemoveChildAt(idx)
+
+							// Вставляем новые элементы
+							for i, el := range newElements {
+								parent.InsertChildAt(idx+i, el)
+							}
 							break
+						}
+					}
+				} else {
+					// Шаблон разбит на несколько узлов
+
+					// 1. Обновляем начальный узел
+					startText := startNode.Text()
+					startNode.SetText(startText[:startOffset])
+
+					// Сохраняем атрибут xml:space если он был
+					if spaceAttr := startNode.SelectAttr("xml:space"); spaceAttr != nil {
+						startNode.CreateAttr("xml:space", "preserve")
+					}
+
+					// 2. Вставляем новые элементы после начального узла
+					parent := startNode.Parent()
+					startIdx := -1
+					for idx, child := range parent.Child {
+						if child == startNode {
+							startIdx = idx
+							break
+						}
+					}
+
+					if startIdx != -1 {
+						// Вставляем новые элементы
+						for i, el := range newElements {
+							parent.InsertChildAt(startIdx+1+i, el)
+						}
+					}
+
+					// 3. Обновляем конечный узел
+					endText := endNode.Text()
+					endNode.SetText(endText[endOffset:])
+
+					// Сохраняем атрибут xml:space если он был
+					if spaceAttr := endNode.SelectAttr("xml:space"); spaceAttr != nil {
+						endNode.CreateAttr("xml:space", "preserve")
+					}
+
+					// 4. Удаляем промежуточные узлы, но сохраняем пробельные
+					startFound := false
+					var nodesToRemove []*etree.Element
+					for _, t := range textNodes {
+						if t == startNode {
+							startFound = true
+							continue
+						}
+
+						if startFound {
+							if t == endNode {
+								break
+							}
+
+							// Не удаляем узлы с xml:space="preserve"
+							if spaceAttr := t.SelectAttr("xml:space"); spaceAttr == nil || spaceAttr.Value != "preserve" {
+								nodesToRemove = append(nodesToRemove, t)
+							}
+						}
+					}
+
+					for _, t := range nodesToRemove {
+						parent := t.Parent()
+						if parent != nil {
+							parent.RemoveChild(t)
 						}
 					}
 				}
 
 			case []string:
 				// Обработка массива строк
-				var newParagraphs []*etree.Element
-				for _, line := range v {
-					newP := createElement("p")
-
-					if pPr != nil {
-						newP.AddChild(pPr.Copy())
-					}
-
-					newR := createElement("r")
-
-					if rPr != nil {
-						newR.AddChild(rPr.Copy())
-					}
-
-					newT := createElement("t")
-					newT.SetText(line)
-
-					newR.AddChild(newT)
-					newP.AddChild(newR)
-					newParagraphs = append(newParagraphs, newP)
+				if len(v) == 0 {
+					continue
 				}
 
-				// Заменяем исходный параграф новыми
-				if parent := p.Parent(); parent != nil {
-					for idx, child := range parent.Child {
-						if child == p {
-							parent.RemoveChild(p)
-							for i, newP := range newParagraphs {
-								parent.InsertChildAt(idx+i, newP)
+				// Модифицируем первую строку с учетом пробела перед шаблоном
+				if start > 0 && fullText[start-1] == ' ' {
+					v[0] = " " + v[0]
+				}
+
+				// Модифицируем последнюю строку с учетом пробела после шаблона
+				if end < len(fullText) && fullText[end] == ' ' {
+					v[len(v)-1] = v[len(v)-1] + " "
+				}
+
+				// Копируем свойства параграфа
+				pPr := p.SelectElement("w:pPr")
+
+				// Заменяем шаблон первой строкой в текущем параграфе
+				if startNode == endNode {
+					text := startNode.Text()
+					startNode.SetText(text[:startOffset] + v[0] + text[endOffset:])
+				} else {
+					// Для разбитого шаблона
+					startText := startNode.Text()
+					startNode.SetText(startText[:startOffset] + v[0])
+
+					// Удаляем промежуточные узлы
+					startFound := false
+					var nodesToRemove []*etree.Element
+					for _, t := range textNodes {
+						if t == startNode {
+							startFound = true
+							continue
+						}
+
+						if startFound {
+							if t == endNode {
+								// Обновляем конечный узел
+								endText := t.Text()
+								t.SetText(endText[endOffset:])
+								break
 							}
-							break
+							nodesToRemove = append(nodesToRemove, t)
+						}
+					}
+
+					for _, t := range nodesToRemove {
+						parent := t.Parent()
+						if parent != nil {
+							parent.RemoveChild(t)
 						}
 					}
 				}
 
-			default:
-				return fmt.Errorf("неподдерживаемый тип newText")
+				// Создаем новые параграфы для остальных строк
+				if len(v) > 1 {
+					parent := p.Parent()
+					if parent == nil {
+						continue
+					}
+
+					// Находим позицию текущего параграфа
+					idx := -1
+					for i, child := range parent.Child {
+						if child == p {
+							idx = i
+							break
+						}
+					}
+
+					if idx != -1 {
+						// Создаем новые параграфы
+						for i := 1; i < len(v); i++ {
+							newP := createElement("p")
+
+							if pPr != nil {
+								newP.AddChild(pPr.Copy())
+							}
+
+							newR := createElement("r")
+
+							if rPr != nil {
+								newR.AddChild(rPr.Copy())
+							}
+
+							newT := createElement("t")
+							newT.SetText(v[i])
+
+							newR.AddChild(newT)
+							newP.AddChild(newR)
+
+							parent.InsertChildAt(idx+i, newP)
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Постобработка: удаление пустых пробельных узлов во всем документе
+	for _, t := range doc.FindElements("//w:t") {
+		if t.Text() == "" {
+			if spaceAttr := t.SelectAttrValue("xml:space", ""); spaceAttr == "preserve" {
+				parent := t.Parent()
+				if parent != nil {
+					t.SetText(" ")
+				}
 			}
 		}
 	}
 
 	doc.Indent(2)
 	return doc.WriteToFile(xmlPath)
+}
+
+// GenerateDocx создает новый DOCX файл с заменой шаблонов
+func GenerateDocx(templatePath string, replacements map[string]interface{}) (string, error) {
+	// Генерация уникального имени выходного файла
+	rand.Seed(time.Now().UnixNano())
+	outputFile := fmt.Sprintf("output_%d_%d.docx", time.Now().UnixNano(), rand.Intn(10000))
+	absOutput, err := filepath.Abs(outputFile)
+	if err != nil {
+		return "", fmt.Errorf("ошибка получения абсолютного пути: %v", err)
+	}
+
+	// Создание временной директории
+	tmpDir, err := os.MkdirTemp("", "docx_*")
+	if err != nil {
+		return "", fmt.Errorf("ошибка создания временной директории: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Распаковка документа
+	if err := UnzipDocx(templatePath, tmpDir); err != nil {
+		return "", fmt.Errorf("ошибка распаковки: %v", err)
+	}
+
+	// Применение замен
+	if err := ReplaceMultiple(tmpDir, replacements); err != nil {
+		return "", err
+	}
+
+	// Создание нового документа
+	if err := ZipDocx(tmpDir, absOutput); err != nil {
+		return "", fmt.Errorf("ошибка упаковки: %v", err)
+	}
+
+	return absOutput, nil
+}
+
+// ProcessDocx обрабатывает документ с использованием временной директории
+func ProcessDocx(templatePath, outputPath string, replacements map[string]interface{}) error {
+	// Создаем уникальную временную директорию
+	tmpDir, err := os.MkdirTemp("", "docx_*")
+	if err != nil {
+		return fmt.Errorf("ошибка создания временной директории: %v", err)
+	}
+	defer os.RemoveAll(tmpDir) // Удаляем временную директорию после завершения
+
+	// Распаковываем документ
+	if err := UnzipDocx(templatePath, tmpDir); err != nil {
+		return fmt.Errorf("ошибка распаковки: %v", err)
+	}
+
+	// Применяем замены
+	if err := ReplaceMultiple(tmpDir, replacements); err != nil {
+		return err
+	}
+
+	// Создаем новый документ
+	return ZipDocx(tmpDir, outputPath)
+}
+
+// ReplaceMultiple заменяет несколько шаблонов в документе
+func ReplaceMultiple(dir string, replacements map[string]interface{}) error {
+	for oldText, newText := range replacements {
+		if err := ReplaceInAllFiles(dir, oldText, newText); err != nil {
+			return fmt.Errorf("ошибка замены '%s': %v", oldText, err)
+		}
+	}
+	return nil
 }
 
 // ReplaceInAllFiles обрабатывает все XML-файлы в DOCX
@@ -270,49 +563,19 @@ func ReplaceInAllFiles(dir, oldText string, newText interface{}) error {
 
 // Пример использования
 func main() {
-	// Распаковка документа
-	err := UnzipDocx("template.docx", "unzipped")
-	if err != nil {
-		panic(err)
-	}
-	defer os.RemoveAll("unzipped")
-
-	// Замена текста во всех частях документа
-	err = ReplaceInAllFiles("unzipped", "{tableName1}", "Иван Иванов\nПетр Петров")
-	if err != nil {
-		panic(err)
-	}
-	err = ReplaceInAllFiles("unzipped", "{data1}", "дата1")
-	if err != nil {
-		panic(err)
-	}
-	err = ReplaceInAllFiles("unzipped", "{data2}", "дата2")
-	if err != nil {
-		panic(err)
-	}
-	err = ReplaceInAllFiles("unzipped", "{data3}", "дата3")
-	if err != nil {
-		panic(err)
-	}
-	err = ReplaceInAllFiles("unzipped", "{data4}", "дата4")
-	if err != nil {
-		panic(err)
-	}
-	err = ReplaceInAllFiles("unzipped", "{data5}", "дата5")
-	if err != nil {
-		panic(err)
+	replacements := map[string]interface{}{
+		"{data1}": "text1",
+		"{data2}": "text2",
+		"{data3}": "text3-1\ntext3-2\ntext3-3",
+		"{data4}": []string{"text4-1", "text4-2", "text4-3"},
+		"{data5}": "text5",
+		"{data6}": "text6",
 	}
 
-	// err = ReplaceInAllFiles("unzipped", "{template2}", []string{"Иван Иванов", "Петр Петров"})
-	// if err != nil {
-	// 	panic(err)
-	// }
-
-	// Создание нового документа
-	err = ZipDocx("unzipped", "modified.docx")
+	outputPath, err := GenerateDocx("template.docx", replacements)
 	if err != nil {
-		panic(err)
+		fmt.Println("Ошибка:", err)
+	} else {
+		fmt.Println("Создан документ:", outputPath)
 	}
-
-	fmt.Println("DOCX успешно изменен!")
 }
